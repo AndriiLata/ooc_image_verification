@@ -1,0 +1,35 @@
+encoder:
+  name: "CLIP"
+  version: "ViT-L/14"
+  device: "cuda:0"
+
+paths:
+  root: "./data/"
+  visualnews: "./data/visualnews/"
+  verite: "./data/verite/"
+  outputs: "./outputs/"
+  evidence_out: "./outputs/evidence/"
+
+run:
+  batch_size: 256
+  workers: 8
+
+aitr:
+  epochs: 50
+  batch_size: 512
+  lr: 1e-4
+  weight_decay: 0.01
+  patience: 10
+  tf_dim: 1024
+  heads_per_layer: [1, 2, 4, 8]
+  pooling: "attention"   # one of: attention | weighted | max
+  use_muse: true
+  use_evidence: 1        # number of evidence items to fuse
+
+muse_mlp:
+  epochs: 50
+  batch_size: 512
+  lr: 1e-4
+  weight_decay: 0.01
+  patience: 10
+  sims: ["img_txt","img_X_img","txt_X_img","img_X_txt","txt_X_txt","X_img_X_txt"]
