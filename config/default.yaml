@@ -1,11 +1,10 @@
 encoder:
   name: "CLIP"
-  version: "ViT-L/14"
-  device: "cuda:0"
+  version: "ViT-B/32"
+  device: "cpu"
 
 paths:
   root: "./data/"
-  visualnews: "./data/visualnews/"
   verite: "./data/verite/"
   outputs: "./outputs/"
   evidence_out: "./outputs/evidence/"
