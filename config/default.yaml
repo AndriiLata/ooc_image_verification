@@ -8,6 +8,14 @@ paths:
   verite: "./data/verite/"
   outputs: "./outputs/"
   evidence_out: "./outputs/evidence/"
+  evidence_root: "./data/evidence/"
+
+evidence:
+  provider: "serpapi"
+  k_results: 1               # how many per direction
+  timeout: 12
+  user_agent: "ooc-verifier/1.0"
+
 
 run:
   batch_size: 256
