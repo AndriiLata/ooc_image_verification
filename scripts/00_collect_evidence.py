@@ -1,5 +1,5 @@
 # scripts/00_collect_evidence.py
-import os, io, json, time, hashlib, yaml, argparse, random
+import os, io, json, time, hashlib, yaml, argparse
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 import requests
@@ -23,7 +23,14 @@ load_dotenv()
 
 # ----------------- read config -----------------
 cfg = yaml.safe_load(open(REPO_ROOT / "config" / "default.yaml"))
+
+# original VERITE root from config (still there if you need it)
 ver_root = (REPO_ROOT / cfg["paths"]["verite"]).resolve()
+
+# SMALL dataset lives under: REPO_ROOT / data / verite_small
+small_root = (REPO_ROOT / "data" / "verite_small").resolve()
+if not small_root.exists():
+    raise SystemExit(f"verite_small folder not found at: {small_root}")
 
 evidence_root_cfg = (
     cfg["paths"].get("evidence_root")
@@ -33,7 +40,8 @@ evidence_root_cfg = (
 evidence_root = (REPO_ROOT / evidence_root_cfg).resolve()
 evidence_root.mkdir(parents=True, exist_ok=True)
 
-K = int(cfg.get("evidence", {}).get("k_results", 3))
+# SerpAPI-related config
+K = int(cfg.get("evidence", {}).get("k_results", 3))  # still max cap if needed
 UA = cfg.get("evidence", {}).get("user_agent", "ooc-verifier/1.0")
 TIMEOUT = int(cfg.get("evidence", {}).get("timeout", 12))
 PROVIDER = cfg.get("evidence", {}).get("provider", "serpapi").lower()
@@ -77,7 +85,7 @@ def fetch_title(url: str) -> str:
         return ""
 
 # ----------------- SerpAPI: text -> image -----------------
-def serpapi_image_search(query: str, num: int) -> List[Dict]:
+def serpapi_image_search(query: str, num: int = 1) -> List[Dict]:
     if not SERPAPI_KEY:
         raise RuntimeError("SERPAPI_KEY not set")
     url = "https://serpapi.com/search.json"
@@ -142,7 +150,7 @@ def _parse_reverse_similar_images(js: dict, num: int) -> List[Dict]:
             break
     return sims
 
-def serpapi_reverse_from_image_url(image_url: str, num: int) -> Tuple[List[Dict], List[Dict]]:
+def serpapi_reverse_from_image_url(image_url: str, num: int = 1) -> Tuple[List[Dict], List[Dict]]:
     if not SERPAPI_KEY:
         raise RuntimeError("SERPAPI_KEY not set")
     url = "https://serpapi.com/search.json"
@@ -161,12 +169,9 @@ def serpapi_reverse_from_image_url(image_url: str, num: int) -> Tuple[List[Dict]
 # ----------------- args -----------------
 def parse_args():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--max_pairs", type=int, default=10)
-    ap.add_argument("--max_unique_images", type=int, default=10)
-    ap.add_argument("--k_results", type=int, default=None)
-    ap.add_argument("--use_article_captions", action="store_true")
-    ap.add_argument("--skip_existing", action="store_true")
-    ap.add_argument("--skip_reverse", action="store_true")
+    ap.add_argument("--max_pairs", type=int, default=None, help="Max number of article rows (ids) to process.")
+    ap.add_argument("--skip_existing", action="store_true", help="Skip ids that already have meta.json.")
+    ap.add_argument("--skip_reverse", action="store_true", help="Skip reverse-image search step.")
     ap.add_argument("--seed", type=int, default=42)
     return ap.parse_args()
 
@@ -178,89 +183,40 @@ def main():
         raise SystemExit("Set SERPAPI_KEY in .env for provider=serpapi")
 
     args = parse_args()
-    random.seed(args.seed)
 
-    # Load VERITE rows
-    ver_csv = ver_root / "VERITE.csv"
-    df = pd.read_csv(ver_csv)
-    if "Unnamed: 0" in df.columns:
-        df = df.drop(columns=["Unnamed: 0"])
-    df["id"] = df.index.astype(int)
+    # Load VERITE_articles_small.csv
+    art_csv = small_root / "VERITE_articles_small.csv"
+    if not art_csv.exists():
+        raise SystemExit(f"VERITE_articles_small.csv not found at: {art_csv}")
 
-    # Optional article captions (for text queries)
-    art_csv = ver_root / "VERITE_articles.csv"
-    articles_for_text = pd.read_csv(art_csv) if (args.use_article_captions and art_csv.exists()) else None
-    if articles_for_text is not None and "id" in articles_for_text.columns:
-        articles_for_text["id"] = pd.to_numeric(articles_for_text["id"], errors="coerce")
+    art_df = pd.read_csv(art_csv)
+    if "id" not in art_df.columns:
+        raise SystemExit("VERITE_articles_small.csv must contain an 'id' column")
 
-    # Article URLs (for reverse)
-    articles_by_id: Dict[int, dict] = {}
-    if art_csv.exists():
-        art_df = pd.read_csv(art_csv)
-        if "id" in art_df.columns:
-            for _, arow in art_df.iterrows():
-                try:
-                    articles_by_id[int(pd.to_numeric(arow["id"], errors="coerce"))] = arow.to_dict()
-                except Exception:
-                    continue
+    # Normalise id to int
+    art_df["id"] = pd.to_numeric(art_df["id"], errors="coerce").astype("Int64")
+    art_df = art_df.dropna(subset=["id"]).reset_index(drop=True)
+    art_df["id"] = art_df["id"].astype(int)
 
-    # sample subset
-    idxs = list(df.index)
-    random.shuffle(idxs)
-    df = df.loc[idxs[:args.max_pairs]].reset_index(drop=True)
-
-    # Unique images (limit reverse)
-    unique_paths = df["image_path"].astype(str).unique().tolist()
-    unique_paths = unique_paths[:args.max_unique_images]
-    reverse_cache: Dict[str, Tuple[List[Dict], List[Dict]]] = {}
-
-    K_local = args.k_results if args.k_results is not None else K
-
-    print(f"[serpapi] reverse-image via image_url for {len(unique_paths)} unique images (K={K_local}) …")
-    for rel in tqdm(unique_paths):
-        # find any VERITE id that uses this image to get its true/false URL
-        try:
-            sample_row = df[df["image_path"] == rel].iloc[0]
-            vid = int(sample_row["id"])
-            art_row = articles_by_id.get(vid, {})
-            # prefer true_url, then false_url
-            image_url = str(art_row.get("true_url") or art_row.get("false_url") or "").strip()
-        except Exception:
-            image_url = ""
-
-        if (not image_url) or args.skip_reverse:
-            reverse_cache[rel] = ([], [])
-            continue
-
-        try:
-            pages, sims = serpapi_reverse_from_image_url(image_url, K_local)
-        except Exception as e:
-            print(f"[warn] reverse failed for {rel}: {e}")
-            pages, sims = ([], [])
-        reverse_cache[rel] = (pages, sims)
-        time.sleep(0.6)
+    if args.max_pairs is not None:
+        art_df = art_df.iloc[:args.max_pairs].reset_index(drop=True)
 
     rows = []
-    print("Collecting per-pair evidence …")
-    for _, r in tqdm(df.iterrows(), total=len(df)):
-        vid = int(r["id"])
-        rel_img = str(r["image_path"])
+
+    print(f"[info] Processing {len(art_df)} ids from VERITE_articles_small.csv using SerpAPI")
+
+    for _, arow in tqdm(art_df.iterrows(), total=len(art_df)):
+        vid = int(arow["id"])
 
         pair_dir = evidence_root / f"{vid:06d}"
         meta_fp = pair_dir / "meta.json"
-        pages_json = pair_dir / "from_image" / "pages.json"
 
         if args.skip_existing and meta_fp.exists():
+            # read existing for aggregated CSV if possible
             try:
-                pages_info = []
-                if pages_json.exists():
-                    pages_info = json.loads(pages_json.read_text(encoding="utf-8")).get("pagesIncluding", [])
-                captions_list = [p.get("title","") or p.get("snippet","") for p in pages_info if (p.get("title") or p.get("snippet"))]
-                images_list = []
-                for sub in ("from_image/images", "from_text/images"):
-                    d = pair_dir / sub
-                    if d.exists():
-                        images_list += [rel_to_repo(p) for p in d.glob("*.jpg")]
+                meta = json.loads(meta_fp.read_text(encoding="utf-8"))
+                captions_list = meta.get("captions", [])
+                images_list = meta.get("images_paths", [])
                 rows.append({
                     "match_index": vid,
                     "captions": json.dumps(captions_list, ensure_ascii=False),
@@ -276,92 +232,173 @@ def main():
         img_from_img_dir.mkdir(parents=True, exist_ok=True)
         img_from_txt_dir.mkdir(parents=True, exist_ok=True)
 
-        # build text queries
-        qlist = []
-        cap = str(r.get("caption", "") or "").strip()
-        if cap:
-            qlist.append(cap)
-        if articles_for_text is not None:
-            a = articles_for_text[articles_for_text["id"] == vid]
-            if len(a):
-                for col in ("true_caption","false_caption","query"):
-                    v = a.iloc[0].get(col, "")
-                    if isinstance(v, str) and v.strip():
-                        qlist.append(v.strip())
-        qlist = list(dict.fromkeys([q for q in qlist if len(q) > 3]))
+        true_caption = str(arow.get("true_caption", "") or "").strip()
+        false_caption = str(arow.get("false_caption", "") or "").strip()
+        true_url = str(arow.get("true_url", "") or "").strip()
+        false_url = str(arow.get("false_url", "") or "").strip()
 
-        # reverse results from cache
-        pages, sims = reverse_cache.get(rel_img, ([], []))
-        pages_info, sim_img_paths, captions_accum = [], [], []
+        captions_accum: List[str] = []
+        images_accum: List[str] = []
+        text_search_meta: List[Dict] = []   # NEW: detailed text search metadata
 
-        # pages including
-        for p in pages[:K_local]:
-            url = p.get("hostPageUrl")
-            title = p.get("title") or fetch_title(url)
-            snippet = p.get("snippet") or ""
-            if title:
-                captions_accum.append(title)
-            elif snippet:
-                captions_accum.append(snippet)
-            pages_info.append({"url": url, "title": title, "snippet": snippet})
-
-        # visual matches
-        for s in sims[:K_local]:
-            vm_title = s.get("title") or fetch_title(s.get("hostPageUrl", ""))
-            if vm_title:
-                captions_accum.append(vm_title)
-            fp = save_image_from_url(s.get("contentUrl",""), img_from_img_dir)
-            if fp:
-                sim_img_paths.append(rel_to_repo(fp))
-
-        # text -> image (first per query)
-        txt_img_paths = []
-        for q in qlist:
+        # ---------- TEXT SEARCH: helper ----------
+        def run_text_search(query: str, query_type: str):
+            nonlocal captions_accum, images_accum, text_search_meta
+            if not query:
+                return
             try:
-                hits = serpapi_image_search(q, num=1)
+                hits = serpapi_image_search(query, num=1)
             except Exception as e:
-                print(f"[warn] text search failed (id={vid}): {e}")
+                print(f"[warn] text search ({query_type}) failed (id={vid}): {e}")
                 hits = []
             if hits:
                 h = hits[0]
-                hit_title = h.get("title") or fetch_title(h.get("hostPageUrl", ""))
+                content_url = h.get("contentUrl", "")
+                host_page = h.get("hostPageUrl", "")
+                hit_title = h.get("title") or fetch_title(host_page)
+
                 if hit_title:
                     captions_accum.append(hit_title)
-                fp = save_image_from_url(h.get("contentUrl",""), img_from_txt_dir)
-                if fp:
-                    txt_img_paths.append(rel_to_repo(fp))
+
+                fp = save_image_from_url(content_url, img_from_txt_dir)
+                downloaded_path = rel_to_repo(fp) if fp else ""
+
+                if downloaded_path:
+                    images_accum.append(downloaded_path)
+
+                text_search_meta.append({
+                    "query_type": query_type,          # "true_caption" or "false_caption"
+                    "query": query,
+                    "result_content_url": content_url,
+                    "result_hostPageUrl": host_page,
+                    "result_title": hit_title,
+                    "downloaded_image": downloaded_path
+                })
             time.sleep(0.6)
 
-        # write sidecars
-        (pair_dir / "from_image").mkdir(parents=True, exist_ok=True)
-        pages_json.write_text(
-            json.dumps({"pagesIncluding": pages_info}, ensure_ascii=False, indent=2),
-            encoding="utf-8"
+        # ---------- TEXT SEARCH: true_caption ----------
+        run_text_search(true_caption, "true_caption")
+
+        # ---------- TEXT SEARCH: false_caption ----------
+        run_text_search(false_caption, "false_caption")
+
+        reverse_meta = {"true": {}, "false": {}}
+
+        # ---------- REVERSE SEARCH: true_url ----------
+        if true_url and not args.skip_reverse:
+            try:
+                pages, sims = serpapi_reverse_from_image_url(true_url, num=1)
+            except Exception as e:
+                print(f"[warn] reverse (true_url) failed (id={vid}): {e}")
+                pages, sims = ([], [])
+            # first similar image if available
+            if sims:
+                s = sims[0]
+                vm_title = s.get("title") or fetch_title(s.get("hostPageUrl", ""))
+                if vm_title:
+                    captions_accum.append(vm_title)
+                fp = save_image_from_url(s.get("contentUrl", ""), img_from_img_dir)
+                if fp:
+                    images_accum.append(rel_to_repo(fp))
+                reverse_meta["true"] = {
+                    "image_url": s.get("contentUrl", ""),
+                    "hostPageUrl": s.get("hostPageUrl", ""),
+                    "title": vm_title,
+                }
+            elif pages:
+                # fallback: use page title/snippet even if we don't have a direct image url
+                p = pages[0]
+                title = p.get("title") or fetch_title(p.get("hostPageUrl", ""))
+                if title:
+                    captions_accum.append(title)
+                reverse_meta["true"] = {
+                    "image_url": "",
+                    "hostPageUrl": p.get("hostPageUrl", ""),
+                    "title": title,
+                }
+            time.sleep(0.6)
+
+        # ---------- REVERSE SEARCH: false_url ----------
+        if false_url and not args.skip_reverse:
+            try:
+                pages, sims = serpapi_reverse_from_image_url(false_url, num=1)
+            except Exception as e:
+                print(f"[warn] reverse (false_url) failed (id={vid}): {e}")
+                pages, sims = ([], [])
+            if sims:
+                s = sims[0]
+                vm_title = s.get("title") or fetch_title(s.get("hostPageUrl", ""))
+                if vm_title:
+                    captions_accum.append(vm_title)
+                fp = save_image_from_url(s.get("contentUrl", ""), img_from_img_dir)
+                if fp:
+                    images_accum.append(rel_to_repo(fp))
+                reverse_meta["false"] = {
+                    "image_url": s.get("contentUrl", ""),
+                    "hostPageUrl": s.get("hostPageUrl", ""),
+                    "title": vm_title,
+                }
+            elif pages:
+                p = pages[0]
+                title = p.get("title") or fetch_title(p.get("hostPageUrl", ""))
+                if title:
+                    captions_accum.append(title)
+                reverse_meta["false"] = {
+                    "image_url": "",
+                    "hostPageUrl": p.get("hostPageUrl", ""),
+                    "title": title,
+                }
+            time.sleep(0.6)
+
+        # local source images (from your small dataset)
+        src_true = (small_root / "images" / f"true_{vid}.jpg").resolve()
+        src_false = (small_root / "images" / f"false_{vid}.jpg").resolve()
+
+        # unique + clean
+        captions_list = list(
+            dict.fromkeys([c for c in captions_accum if isinstance(c, str) and c.strip()])
         )
+        images_list = list(
+            dict.fromkeys([p for p in images_accum if isinstance(p, str) and p.strip()])
+        )
+
+        # write meta.json with extra info for debugging
+        pair_dir.mkdir(parents=True, exist_ok=True)
         meta_fp.write_text(
-            json.dumps({
-                "verite_id": vid,
-                "source_image": str((ver_root / rel_img).resolve()),
-                "text_queries": qlist,
-                "n_similar_images": len(sim_img_paths),
-                "n_text_images": len(txt_img_paths)
-            }, ensure_ascii=False, indent=2),
-            encoding="utf-8"
+            json.dumps(
+                {
+                    "id": vid,
+                    "true_caption": true_caption,
+                    "false_caption": false_caption,
+                    "true_url": true_url,
+                    "false_url": false_url,
+                    "source_image_true": str(src_true) if src_true.exists() else "",
+                    "source_image_false": str(src_false) if src_false.exists() else "",
+                    "reverse": reverse_meta,
+                    "text_search": text_search_meta,       # NEW: detailed text search info
+                    "captions": captions_list,             # aggregated evidence captions
+                    "images_paths": images_list,           # aggregated evidence images
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
         )
 
         # row for encoder step
-        captions_list = list(dict.fromkeys([c for c in captions_accum if isinstance(c, str) and c.strip()]))
-        images_list = sim_img_paths + txt_img_paths
-        rows.append({
-            "match_index": vid,
-            "captions": json.dumps(captions_list, ensure_ascii=False),
-            "images_paths": json.dumps(images_list, ensure_ascii=False),
-        })
+        rows.append(
+            {
+                "match_index": vid,
+                "captions": json.dumps(captions_list, ensure_ascii=False),
+                "images_paths": json.dumps(images_list, ensure_ascii=False),
+            }
+        )
 
-    out_csv = evidence_root / "collected_evidence.csv"
+    out_csv = evidence_root / "collected_evidence_small.csv"
     pd.DataFrame(rows).to_csv(out_csv, index=False)
     print(f"✓ Evidence saved under {rel_to_repo(evidence_root)}")
     print(f"✓ CSV for encoder: {rel_to_repo(out_csv)}")
+
 
 if __name__ == "__main__":
     main()
