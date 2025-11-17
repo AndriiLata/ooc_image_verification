@@ -17,9 +17,11 @@ def rank_evidence(samples_df: pd.DataFrame,
     """
     out_rows = []
     for _, r in samples_df.iterrows():
-        qid = str(r["id"]); iid = str(r["image_id"])
-        q_img = q_img_map[qid].values
-        q_txt = q_txt_map[iid].values  # consistent with their code: text keyed by id, image by image_id
+        qid = str(r["id"])
+        iid = str(r["image_id"])
+        # image keyed by image_id, text keyed by id
+        q_img = q_img_map[iid].values
+        q_txt = q_txt_map[qid].values
 
         img_rank, img_s = _rank(q_img, ev_img_mat, ev_img_ids, topk)
         txt_rank, txt_s = _rank(q_txt, ev_txt_mat, ev_txt_ids, topk)

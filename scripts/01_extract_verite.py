@@ -33,7 +33,7 @@ if "Unnamed: 0" in df.columns:
 
 # add ids/labels
 df["id"] = df.index.astype(str)  # string ids: "0", "1", ...
-df["image_id"] = df["image_path"].astype(str)
+df["image_id"] = df["id"]
 
 # binary label if you want "misuse vs true"
 # Option A: only miscaptioned = 1
